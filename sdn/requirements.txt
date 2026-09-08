@@ -1,0 +1,7 @@
+# Ryu OpenFlow Controller Requirements
+# Note: Ryu requires a Linux environment (Ubuntu 20.04/22.04 LTS recommended)
+# with Python 3.8 - 3.10 and Open vSwitch installed.
+ryu>=4.34
+eventlet>=0.30.2,<0.34.0
+requests>=2.31.0
+netaddr>=0.8.0

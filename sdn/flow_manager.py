@@ -1,4 +1,10 @@
-from os_ken.ofproto import ofproto_v1_3
+try:
+    from ryu.ofproto import ofproto_v1_3
+except ImportError:
+    try:
+        from os_ken.ofproto import ofproto_v1_3
+    except ImportError:
+        ofproto_v1_3 = None
 
 
 class FlowManager:
@@ -6,9 +12,15 @@ class FlowManager:
     def __init__(self, logger):
         self.logger = logger
 
-
-    def add_flow(self, datapath, priority, match, actions):
-
+    def add_flow(
+        self,
+        datapath,
+        priority: int,
+        match,
+        actions,
+        idle_timeout: int = 0,
+        hard_timeout: int = 0,
+    ):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
@@ -23,14 +35,17 @@ class FlowManager:
             datapath=datapath,
             priority=priority,
             match=match,
-            instructions=instructions
+            instructions=instructions,
+            idle_timeout=idle_timeout,
+            hard_timeout=hard_timeout,
         )
 
         datapath.send_msg(flow_mod)
 
         self.logger.info(
-            "Flow rule added to switch %s",
-            datapath.id
+            "Flow rule added to switch %s (priority=%d)",
+            datapath.id,
+            priority,
         )
 
 

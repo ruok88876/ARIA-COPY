@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  # MongoDB Persistence Store
+  aria-mongodb:
+    image: mongo:7.0
+    container_name: aria-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - aria_mongo_data:/data/db
+    environment:
+      - MONGO_INITDB_DATABASE=aria_db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ARIA FastAPI Backend API & Intelligence Engine
+  aria-backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    container_name: aria-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - MONGODB_URI=mongodb://aria-mongodb:27017
+      - MONGODB_DATABASE=aria_db
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - LOG_LEVEL=INFO
+      - COWRIE_LOG_PATH=/app/honeypot/logs/cowrie.json
+    volumes:
+      - ./honeypot:/app/honeypot
+      - ./tests/fixtures:/app/tests/fixtures
+    depends_on:
+      aria-mongodb:
+        condition: service_healthy
+
+  # Cowrie Honeypot (Optional containerized decoy)
+  aria-cowrie:
+    image: cowrie/cowrie:latest
+    container_name: aria-cowrie
+    restart: unless-stopped
+    ports:
+      - "2222:2222" # SSH decoy port
+      - "2223:2223" # Telnet decoy port
+    volumes:
+      - ./honeypot/logs:/cowrie/var/log/cowrie
+
+volumes:
+  aria_mongo_data:
+    driver: local

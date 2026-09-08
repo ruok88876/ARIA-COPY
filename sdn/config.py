@@ -5,12 +5,20 @@ CONTROLLER_PORT = 6653
 
 
 # Network nodes
-
 SERVER_IP = "10.0.0.10"
+SERVER_MAC = "00:00:00:00:00:02"
+SERVER_PORT = 2
 
 HONEYPOT_IP = "10.0.0.50"
+HONEYPOT_MAC = "00:00:00:00:00:03"
+HONEYPOT_PORT = 3
 
+ATTACKER_IP = "10.0.0.1"
+ATTACKER_MAC = "00:00:00:00:00:01"
+ATTACKER_PORT = 1
 
 # Detection settings
-
 SUSPICIOUS_THRESHOLD = 5
+
+# Backend Integration
+BACKEND_TELEMETRY_URL = "http://127.0.0.1:8000/api/v1/sdn/telemetry"
