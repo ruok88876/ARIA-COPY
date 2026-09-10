@@ -44,13 +44,13 @@ try:
     from sdn.monitor import TrafficMonitor
     from sdn.redirector import Redirector
     from sdn.sdn_reporter import SDNReporter
-    from sdn.config import HONEYPOT_IP, SERVER_IP
+    from sdn.config import HONEYPOT_IP, SERVER_IP, HONEYPOT_MAC, HONEYPOT_PORT
 except ImportError:
     from flow_manager import FlowManager
     from monitor import TrafficMonitor
     from redirector import Redirector
     from sdn_reporter import SDNReporter
-    from config import HONEYPOT_IP, SERVER_IP
+    from config import HONEYPOT_IP, SERVER_IP, HONEYPOT_MAC, HONEYPOT_PORT
 
 
 class ARIAController(BaseControllerApp):
@@ -115,6 +115,30 @@ class ARIAController(BaseControllerApp):
             datapath.id,
         )
 
+        # SSH inspection flow: TCP dst port 22 packets always reach the
+        # controller for connection-attempt counting, overriding any
+        # MAC-learning forwarding flows (priority 1).
+        ssh_match = parser.OFPMatch(
+            eth_type=0x0800,
+            ip_proto=6,
+            tcp_dst=22,
+        )
+        ssh_actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
+                                              ofproto.OFPCML_NO_BUFFER)]
+
+        self.flow_manager.add_flow(
+            datapath=datapath,
+            priority=5,
+            match=ssh_match,
+            actions=ssh_actions,
+        )
+
+        self.logger.info(
+            "SSH inspection flow installed on switch %s "
+            "(priority=5, match=tcp_dst:22, action=OUTPUT:CONTROLLER)",
+            datapath.id,
+        )
+
     # Switch connection / disconnection tracking
     @set_ev_cls(
         ofp_event.EventOFPStateChange if ofp_event else None,
@@ -143,6 +167,7 @@ class ARIAController(BaseControllerApp):
 
         Flow priority hierarchy:
             200  – SSH redirect rules (installed by Redirector)
+              5  – SSH inspection: tcp_dst=22 → controller (switch_features)
               1  – learned MAC forwarding rules (installed here)
               0  – table-miss → send to controller
         """
@@ -207,6 +232,14 @@ class ARIAController(BaseControllerApp):
             telemetry.get("ssh_detected"),
             telemetry.get("redirected"),
         )
+
+        # If this packet triggered redirection or is already redirected, route to honeypot
+        if telemetry.get("redirected"):
+            actions = [
+                parser.OFPActionSetField(ipv4_dst=HONEYPOT_IP),
+                parser.OFPActionSetField(eth_dst=HONEYPOT_MAC),
+                parser.OFPActionOutput(HONEYPOT_PORT),
+            ]
 
         # --- Forward / flood the current packet (packet-out) ----------------
         data = None

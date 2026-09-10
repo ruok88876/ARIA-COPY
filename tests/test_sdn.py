@@ -48,6 +48,7 @@ def test_ssh_threshold_detection(monitor):
         "src_ip": "10.0.0.1",
         "dst_ip": "10.0.0.10",
         "dst_port": 22,
+        "tcp_flags": 0x02,  # TCP SYN
         "protocol": "TCP",
     }
 
@@ -172,16 +173,17 @@ def controller():
 
 
 def test_switch_features_handler_installs_table_miss(controller):
-    """switch_features_handler must install exactly one table-miss flow on the switch."""
+    """switch_features_handler must install table-miss flow (priority 0) and SSH inspection flow (priority 5)."""
     dp = _FakeDatapath(dp_id=1)
     ev = _FakeSwitchFeaturesEvent(dp)
 
     controller.switch_features_handler(ev)
 
-    # Exactly one FlowMod should have been sent
-    assert len(dp.sent_msgs) == 1
-    flow_mod = dp.sent_msgs[0]
-    assert isinstance(flow_mod, _FakeFlowMod)
+    # Table-miss and SSH inspection FlowMods should have been sent
+    assert len(dp.sent_msgs) == 2
+    priorities = {m.kwargs["priority"] for m in dp.sent_msgs if isinstance(m, _FakeFlowMod)}
+    assert 0 in priorities
+    assert 5 in priorities
 
 
 def test_table_miss_flow_priority_zero(controller):
@@ -191,8 +193,10 @@ def test_table_miss_flow_priority_zero(controller):
 
     controller.switch_features_handler(ev)
 
-    flow_mod = dp.sent_msgs[0]
-    assert flow_mod.kwargs["priority"] == 0
+    # First message is table-miss flow at priority 0
+    table_miss_mods = [m for m in dp.sent_msgs if m.kwargs.get("priority") == 0]
+    assert len(table_miss_mods) == 1
+    assert table_miss_mods[0].kwargs["priority"] == 0
 
 
 def test_table_miss_flow_wildcard_match(controller):
@@ -202,8 +206,8 @@ def test_table_miss_flow_wildcard_match(controller):
 
     controller.switch_features_handler(ev)
 
-    flow_mod = dp.sent_msgs[0]
-    match = flow_mod.kwargs["match"]
+    table_miss_mods = [m for m in dp.sent_msgs if m.kwargs.get("priority") == 0]
+    match = table_miss_mods[0].kwargs["match"]
     assert isinstance(match, _FakeMatch)
     # Wildcard match has no fields
     assert match.fields == {}
@@ -216,8 +220,8 @@ def test_table_miss_flow_action_output_controller(controller):
 
     controller.switch_features_handler(ev)
 
-    flow_mod = dp.sent_msgs[0]
-    instructions = flow_mod.kwargs["instructions"]
+    table_miss_mods = [m for m in dp.sent_msgs if m.kwargs.get("priority") == 0]
+    instructions = table_miss_mods[0].kwargs["instructions"]
     assert len(instructions) == 1
 
     inst = instructions[0]
@@ -239,21 +243,21 @@ def test_table_miss_flow_no_timeouts(controller):
 
     controller.switch_features_handler(ev)
 
-    flow_mod = dp.sent_msgs[0]
-    assert flow_mod.kwargs.get("idle_timeout", 0) == 0
-    assert flow_mod.kwargs.get("hard_timeout", 0) == 0
+    table_miss_mods = [m for m in dp.sent_msgs if m.kwargs.get("priority") == 0]
+    assert table_miss_mods[0].kwargs.get("idle_timeout", 0) == 0
+    assert table_miss_mods[0].kwargs.get("hard_timeout", 0) == 0
 
 
 def test_switch_features_handler_multiple_switches(controller):
-    """Each switch that connects gets its own table-miss flow independently."""
+    """Each switch that connects gets its flows independently."""
     dp1 = _FakeDatapath(dp_id=1)
     dp2 = _FakeDatapath(dp_id=2)
 
     controller.switch_features_handler(_FakeSwitchFeaturesEvent(dp1))
     controller.switch_features_handler(_FakeSwitchFeaturesEvent(dp2))
 
-    assert len(dp1.sent_msgs) == 1
-    assert len(dp2.sent_msgs) == 1
+    assert len(dp1.sent_msgs) == 2
+    assert len(dp2.sent_msgs) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +280,7 @@ class _FakePacketInEvent:
 
 
 def _build_raw_packet(src_mac_bytes, dst_mac_bytes, src_ip, dst_ip,
-                      src_port=12345, dst_port=80):
+                      src_port=12345, dst_port=80, tcp_flags=2):
     """Build a minimal raw Ethernet + IPv4 + TCP frame for testing."""
     eth_type = struct.pack("!H", 0x0800)
     ip_header = struct.pack(
@@ -287,7 +291,7 @@ def _build_raw_packet(src_mac_bytes, dst_mac_bytes, src_ip, dst_ip,
         socket.inet_aton(dst_ip),
     )
     tcp_header = struct.pack("!HHIIBBHHH",
-                             src_port, dst_port, 100, 0, (5 << 4), 2, 8192, 0, 0)
+                             src_port, dst_port, 100, 0, (5 << 4), tcp_flags, 8192, 0, 0)
     return dst_mac_bytes + src_mac_bytes + eth_type + ip_header + tcp_header
 
 
@@ -445,3 +449,166 @@ def test_suspicious_ssh_redirect_overrides_forwarding(controller):
     all_priorities = sorted({f.kwargs["priority"] for f in flow_mods}, reverse=True)
     assert all_priorities[0] == 200
     assert 1 in all_priorities
+
+    # Verify triggering packet (attempt 2) packet-out rewrites to honeypot port (port 3)
+    packet_outs = [m for m in dp.sent_msgs if isinstance(m, _FakePacketOut)]
+    assert len(packet_outs) >= 1
+    triggering_actions = packet_outs[-1].kwargs["actions"]
+    # Check that honeypot port 3 is the output action
+    assert any(isinstance(a, _FakeActionOutput) and a.port == 3 for a in triggering_actions)
+
+
+def test_ssh_syn_counts_as_one_attempt(monitor):
+    """Initial TCP SYN packet to protected server port 22 increments attempt counter by 1."""
+    packet = {
+        "src_ip": "10.0.0.1",
+        "dst_ip": "10.0.0.10",
+        "dst_port": 22,
+        "tcp_flags": 0x02,  # SYN
+        "protocol": "TCP",
+    }
+    t = monitor.analyze_packet(packet)
+    assert t["connection_count"] == 1
+    assert t["ssh_detected"] is True
+    assert t["should_redirect"] is False
+
+
+def test_ssh_ack_does_not_increment(monitor):
+    """TCP ACK packet does not increment the SSH attempt counter."""
+    syn_packet = {
+        "src_ip": "10.0.0.1",
+        "dst_ip": "10.0.0.10",
+        "dst_port": 22,
+        "tcp_flags": 0x02,  # SYN
+        "protocol": "TCP",
+    }
+    monitor.analyze_packet(syn_packet)
+    assert monitor.ssh_attempts["10.0.0.1"] == 1
+
+    ack_packet = {
+        "src_ip": "10.0.0.1",
+        "dst_ip": "10.0.0.10",
+        "dst_port": 22,
+        "tcp_flags": 0x10,  # ACK
+        "protocol": "TCP",
+    }
+    t = monitor.analyze_packet(ack_packet)
+    assert t["connection_count"] == 1
+    assert monitor.ssh_attempts["10.0.0.1"] == 1
+
+
+def test_ssh_syn_ack_does_not_increment(monitor):
+    """TCP SYN-ACK packet does not increment the SSH attempt counter."""
+    syn_ack = {
+        "src_ip": "10.0.0.1",
+        "dst_ip": "10.0.0.10",
+        "dst_port": 22,
+        "tcp_flags": 0x12,  # SYN + ACK
+        "protocol": "TCP",
+    }
+    t = monitor.analyze_packet(syn_ack)
+    assert t["connection_count"] == 0
+    assert monitor.ssh_attempts["10.0.0.1"] == 0
+
+
+def test_ssh_rst_does_not_increment(monitor):
+    """TCP RST packet does not increment the SSH attempt counter."""
+    rst_packet = {
+        "src_ip": "10.0.0.1",
+        "dst_ip": "10.0.0.10",
+        "dst_port": 22,
+        "tcp_flags": 0x04,  # RST
+        "protocol": "TCP",
+    }
+    t = monitor.analyze_packet(rst_packet)
+    assert t["connection_count"] == 0
+    assert monitor.ssh_attempts["10.0.0.1"] == 0
+
+
+def test_server_to_attacker_does_not_increment(monitor):
+    """Server-to-attacker responses do not increment attacker SSH attempts."""
+    server_reply = {
+        "src_ip": "10.0.0.10",
+        "dst_ip": "10.0.0.1",
+        "src_port": 22,
+        "dst_port": 48999,
+        "tcp_flags": 0x12,  # SYN-ACK
+        "protocol": "TCP",
+    }
+    t = monitor.analyze_packet(server_reply)
+    assert t["connection_count"] == 0
+    assert monitor.ssh_attempts["10.0.0.1"] == 0
+    assert monitor.ssh_attempts["10.0.0.10"] == 0
+    assert t["ssh_detected"] is False
+
+
+def test_generic_mac_forwarding_does_not_bypass_ssh_inspection(controller):
+    """Priority-5 SSH inspection flow ensures SSH traffic reaches controller even when priority-1 MAC flow exists."""
+    dp = _FakeDatapath(dp_id=1)
+    ev = _FakeSwitchFeaturesEvent(dp)
+    controller.switch_features_handler(ev)
+
+    ssh_flows = [m for m in dp.sent_msgs if m.kwargs.get("priority") == 5]
+    assert len(ssh_flows) == 1
+    flow = ssh_flows[0]
+    match = flow.kwargs["match"]
+    assert match.fields["ip_proto"] == 6
+    assert match.fields["tcp_dst"] == 22
+    actions = flow.kwargs["instructions"][0].actions
+    assert actions[0].port == _FakeOFProto.OFPP_CONTROLLER
+
+    # Priority 5 > Priority 1
+    assert flow.kwargs["priority"] > 1
+
+
+def test_threshold_reaches_5():
+    """Default suspicious threshold is 5; attempt 5 triggers redirection."""
+    logger = logging.getLogger("test_thresh5")
+    mon = TrafficMonitor(logger, suspicious_threshold=5)
+    syn_packet = {
+        "src_ip": "10.0.0.1",
+        "dst_ip": "10.0.0.10",
+        "dst_port": 22,
+        "tcp_flags": 0x02,
+        "protocol": "TCP",
+    }
+    for attempt in range(1, 5):
+        t = mon.analyze_packet(syn_packet)
+        assert t["connection_count"] == attempt
+        assert t["should_redirect"] is False
+        assert t["status"] == "ssh_detected"
+
+    # Attempt 5: triggers redirect
+    t5 = mon.analyze_packet(syn_packet)
+    assert t5["connection_count"] == 5
+    assert t5["should_redirect"] is True
+    assert t5["status"] == "suspicious"
+
+
+def test_ordinary_arp_icmp_forwarding_remains_functional(controller):
+    """Non-SSH traffic (e.g. ICMP/ping or port 80) is learned and forwarded at priority 1 without redirection."""
+    dp = _FakeDatapath(dp_id=1)
+
+    # Server sends packet from port 2
+    pkt_server = _build_raw_packet(_SERVER_MAC, _ATTACKER_MAC,
+                                   "10.0.0.10", "10.0.0.1", dst_port=80)
+    controller.packet_in_handler(_FakePacketInEvent(_FakePacketInMsg(dp, data=pkt_server, in_port=2)))
+    dp.sent_msgs.clear()
+
+    # Attacker sends HTTP packet to server (port 80)
+    pkt_http = _build_raw_packet(_ATTACKER_MAC, _SERVER_MAC,
+                                 "10.0.0.1", "10.0.0.10", dst_port=80)
+    controller.packet_in_handler(_FakePacketInEvent(_FakePacketInMsg(dp, data=pkt_http, in_port=1)))
+
+    # Should install priority-1 forwarding rule to port 2
+    flow_mods = [m for m in dp.sent_msgs if isinstance(m, _FakeFlowMod)]
+    assert len(flow_mods) == 1
+    assert flow_mods[0].kwargs["priority"] == 1
+    actions = flow_mods[0].kwargs["instructions"][0].actions
+    assert actions[0].port == 2
+
+    # Should NOT have any redirect flows
+    redirect_flows = [m for m in flow_mods if m.kwargs.get("priority") == 200]
+    assert len(redirect_flows) == 0
+    assert controller.redirector.is_redirected("10.0.0.1") is False
+

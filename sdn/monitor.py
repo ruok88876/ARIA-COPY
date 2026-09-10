@@ -82,6 +82,7 @@ class TrafficMonitor:
         dst_ip = None
         src_port = None
         dst_port = None
+        tcp_flags = None
         protocol = "TCP"
         sid = switch_id
 
@@ -91,6 +92,7 @@ class TrafficMonitor:
             dst_ip = packet_data.get("dst_ip")
             src_port = packet_data.get("src_port")
             dst_port = packet_data.get("dst_port")
+            tcp_flags = packet_data.get("tcp_flags")
             protocol = packet_data.get("protocol", "TCP")
             sid = packet_data.get("switch", switch_id)
             if "raw_data" in packet_data and isinstance(packet_data["raw_data"], bytes):
@@ -99,6 +101,7 @@ class TrafficMonitor:
                 dst_ip = dst_ip or parsed.get("dst_ip")
                 src_port = src_port or parsed.get("src_port")
                 dst_port = dst_port or parsed.get("dst_port")
+                tcp_flags = tcp_flags if tcp_flags is not None else parsed.get("tcp_flags")
                 protocol = parsed.get("protocol") or protocol
 
         # Case B: Raw bytes input
@@ -108,6 +111,7 @@ class TrafficMonitor:
             dst_ip = parsed.get("dst_ip")
             src_port = parsed.get("src_port")
             dst_port = parsed.get("dst_port")
+            tcp_flags = parsed.get("tcp_flags")
             protocol = parsed.get("protocol") or "TCP"
 
         # Case C: Ryu OFPPacketIn event or object
@@ -117,6 +121,7 @@ class TrafficMonitor:
             dst_ip = parsed.get("dst_ip")
             src_port = parsed.get("src_port")
             dst_port = parsed.get("dst_port")
+            tcp_flags = parsed.get("tcp_flags")
             protocol = parsed.get("protocol") or "TCP"
             if hasattr(packet_data, "datapath"):
                 sid = packet_data.datapath.id
@@ -125,12 +130,21 @@ class TrafficMonitor:
         dst_ip = dst_ip or SERVER_IP
         now_ts = datetime.now(timezone.utc).isoformat()
 
-        # Check for SSH traffic (Port 22)
-        ssh_detected = (dst_port == 22 or src_port == 22)
+        # SSH detection: only inbound traffic TO port 22 on the protected server
+        ssh_detected = (dst_port == 22 and dst_ip == SERVER_IP and src_ip != SERVER_IP)
         suspicious = False
         should_redirect = False
 
-        if ssh_detected:
+        # Count only initial TCP SYN as a new SSH connection attempt:
+        # - TCP SYN = set (0x02)
+        # - TCP ACK = not set (0x10)
+        # - TCP RST = not set (0x04)
+        syn_set = bool(tcp_flags is not None and (tcp_flags & 0x02))
+        ack_set = bool(tcp_flags is not None and (tcp_flags & 0x10))
+        rst_set = bool(tcp_flags is not None and (tcp_flags & 0x04))
+        is_syn_only = syn_set and not ack_set and not rst_set
+
+        if ssh_detected and is_syn_only:
             self.ssh_attempts[src_ip] += 1
             attempts = self.ssh_attempts[src_ip]
 
@@ -145,13 +159,16 @@ class TrafficMonitor:
                 )
             else:
                 self.logger.info(
-                    "SSH connection observed from %s (attempt %d/%d)",
+                    "SSH connection attempt from %s (attempt %d/%d)",
                     src_ip,
                     attempts,
                     self.threshold,
                 )
         else:
             attempts = self.ssh_attempts.get(src_ip, 0)
+            if ssh_detected and attempts >= self.threshold:
+                suspicious = True
+                should_redirect = True
 
         status_str = "suspicious" if suspicious else ("ssh_detected" if ssh_detected else "normal")
 
