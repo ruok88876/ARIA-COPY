@@ -62,6 +62,7 @@ class ARIAController(BaseControllerApp):
         super(ARIAController, self).__init__(*args, **kwargs)
 
         self.datapaths = {}
+        self.mac_to_port = {}  # {dpid: {mac_addr: port_no}}
         # Set up logger fallback if not running inside Ryu framework
         if not hasattr(self, "logger"):
             import logging
@@ -138,12 +139,50 @@ class ARIAController(BaseControllerApp):
         MAIN_DISPATCHER
     )
     def packet_in_handler(self, ev):
-        """Inspect inbound packet; trigger redirection if suspicious SSH threshold exceeded."""
+        """L2 learning switch with SSH inspection and honeypot redirection.
+
+        Flow priority hierarchy:
+            200  – SSH redirect rules (installed by Redirector)
+              1  – learned MAC forwarding rules (installed here)
+              0  – table-miss → send to controller
+        """
         msg = ev.msg
         datapath = msg.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        dpid = datapath.id
+        in_port = msg.match['in_port']
 
-        # Analyze packet and check for SSH activity
-        telemetry = self.monitor.analyze_packet(msg, switch_id=datapath.id)
+        # --- L2 MAC learning ------------------------------------------------
+        pkt_parsed = self.monitor.parse_packet_bytes(msg.data)
+        src_mac = pkt_parsed.get('src_mac')
+        dst_mac = pkt_parsed.get('dst_mac')
+
+        self.mac_to_port.setdefault(dpid, {})
+        if src_mac:
+            self.mac_to_port[dpid][src_mac] = in_port
+
+        # Determine output: known destination → unicast, unknown → flood
+        if dst_mac and dst_mac in self.mac_to_port.get(dpid, {}):
+            out_port = self.mac_to_port[dpid][dst_mac]
+        else:
+            out_port = ofproto.OFPP_FLOOD
+
+        actions = [parser.OFPActionOutput(out_port)]
+
+        # Install a forwarding flow for known unicast destinations (priority 1)
+        if out_port != ofproto.OFPP_FLOOD:
+            match = parser.OFPMatch(in_port=in_port, eth_dst=dst_mac)
+            self.flow_manager.add_flow(
+                datapath=datapath,
+                priority=1,
+                match=match,
+                actions=actions,
+                idle_timeout=300,
+            )
+
+        # --- SSH analysis & redirection (existing ARIA logic) ----------------
+        telemetry = self.monitor.analyze_packet(msg, switch_id=dpid)
 
         if telemetry.get("should_redirect"):
             attacker_ip = telemetry["attacker_ip"]
@@ -168,3 +207,17 @@ class ARIAController(BaseControllerApp):
             telemetry.get("ssh_detected"),
             telemetry.get("redirected"),
         )
+
+        # --- Forward / flood the current packet (packet-out) ----------------
+        data = None
+        if msg.buffer_id == ofproto.OFP_NO_BUFFER:
+            data = msg.data
+
+        out_msg = parser.OFPPacketOut(
+            datapath=datapath,
+            buffer_id=msg.buffer_id,
+            in_port=in_port,
+            actions=actions,
+            data=data,
+        )
+        datapath.send_msg(out_msg)
