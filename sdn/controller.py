@@ -74,6 +74,46 @@ class ARIAController(BaseControllerApp):
 
         self.logger.info("ARIA SDN Controller initialized successfully (OpenFlow 1.3 / Ryu)")
 
+    # Table-miss flow installation on switch feature negotiation
+    @set_ev_cls(
+        ofp_event.EventOFPSwitchFeatures if ofp_event else None,
+        CONFIG_DISPATCHER,
+    )
+    def switch_features_handler(self, ev):
+        """Install table-miss flow entry when a switch completes OpenFlow handshake.
+
+        Without this rule, the switch has no instruction to forward unmatched
+        packets to the controller and PacketIn events will never fire.
+        """
+        datapath = ev.msg.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        self.logger.info(
+            "Switch features received: datapath_id=%s, n_buffers=%d, n_tables=%d",
+            datapath.id,
+            ev.msg.n_buffers,
+            ev.msg.n_tables,
+        )
+
+        # Empty match = wildcard (matches every packet)
+        match = parser.OFPMatch()
+        # Send full packet to controller (no buffer)
+        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
+                                          ofproto.OFPCML_NO_BUFFER)]
+
+        self.flow_manager.add_flow(
+            datapath=datapath,
+            priority=0,
+            match=match,
+            actions=actions,
+        )
+
+        self.logger.info(
+            "Table-miss flow installed on switch %s (priority=0, action=OUTPUT:CONTROLLER)",
+            datapath.id,
+        )
+
     # Switch connection / disconnection tracking
     @set_ev_cls(
         ofp_event.EventOFPStateChange if ofp_event else None,
